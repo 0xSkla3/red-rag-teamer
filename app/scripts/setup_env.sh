@@ -17,3 +17,9 @@ pip install --upgrade pip
 pip install --no-cache-dir -r requirements.txt
 
 echo "-> Entorno virtual creado y dependencias instaladas."
+
+# 5) Exportando variables de entorno
+
+export $(cat .env | xargs)
+
+echo "-> Variables de entorno exportadas."

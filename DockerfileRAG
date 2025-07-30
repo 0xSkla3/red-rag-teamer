@@ -7,6 +7,9 @@ LABEL maintainer="you@domain.com" \
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+ARG OLLAMA_URL=http://localhost:11434
+ARG QDRANT_URL=http://localhost:6333
+
 # 1) Dependencias del sistema
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
