@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup_env.sh — Script para crear y configurar el entorno virtual del RAG service
 
-set -euo pipefail
+#set -euo pipefail
 
 # 1) Crear el virtualenv en .venv
 python3 -m venv .venv
