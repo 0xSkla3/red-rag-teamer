@@ -1,0 +1,35 @@
+# DockerfileLLM
+# ------------------------------------------------------------
+# Imagen base optimizada para GPU
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
+
+LABEL maintainer="you@domain.com" \
+      version="1.0.0"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1) Dependencias mínimas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2) Instala Ollama CLI
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+# 3) Usuario no-root
+RUN groupadd -r app && useradd -r -u 10000 -g app app
+USER app:app
+WORKDIR /home/app
+
+# 4) Copia config opcional (límites GPU, logging...)
+COPY --chown=app:app ollama-config.json /home/app/.ollama/config.json
+
+# 5) Healthcheck para asegurar que Ollama levanta correctamente
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -f http://localhost:11434/api/tags || exit 1
+
+EXPOSE 11434
+
+# 6) Arranca Ollama en modo GPU
+ENTRYPOINT ["ollama", "serve", "--host", "0.0.0.0", "--port", "11434", "--gpu"]

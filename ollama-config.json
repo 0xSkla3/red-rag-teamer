@@ -1,0 +1,9 @@
+{
+  "numa": false,
+  "gpu": true,
+  "num_gpu_layers": 9999,
+  "use_mlock": true,
+  "max_gpu_memory": "14GB",
+  "keep_alive": -1,
+  "log_level": "info"
+}
