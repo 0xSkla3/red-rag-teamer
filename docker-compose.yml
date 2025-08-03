@@ -78,7 +78,7 @@ services:
       context: .
       dockerfile: DockerfileRAG
     depends_on:
-      #- ollama
+      - ollama
       - qdrant
     environment:
       - OLLAMA_URL=http://ollama:11434
