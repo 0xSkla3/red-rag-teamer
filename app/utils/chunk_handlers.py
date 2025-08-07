@@ -109,3 +109,30 @@ class BinaryDataHandler(ChunkHandler):
 class TextChunkHandler(ChunkHandler):
     def can_handle(self, text: str) -> bool:
         return True
+
+
+class CloudSecurityHandler(ChunkHandler):
+    def can_handle(self, text: str) -> bool:
+        patterns = [
+            r'\b(AWS|Azure|GCP|S3|EC2|Lambda|CloudFormation|Terraform)\b',
+            r'\b(Storage Account|Key Vault|IAM Role|Security Group)\b'
+        ]
+        return any(re.search(p, text) for p in patterns)
+
+class OWASPHandler(ChunkHandler):
+    def can_handle(self, text: str) -> bool:
+        patterns = [
+            r'\b(OWASP Top 10|A[1-9])\b',
+            r'\b(XSS|SQLi|CSRF|SSRF|XXE|Insecure Deserialization)\b',
+            r'\b(Content Security Policy|CORS|Clickjacking)\b'
+        ]
+        return any(re.search(p, text) for p in patterns)
+
+class ActiveDirectoryHandler(ChunkHandler):
+    def can_handle(self, text: str) -> bool:
+        patterns = [
+            r'\b(Active Directory|AD|Kerberos|NTLM|LDAP)\b',
+            r'\b(Domain Controller|Forest|Trust|Group Policy)\b',
+            r'\b(Golden Ticket|Silver Ticket|Pass the Hash|DCSync)\b'
+        ]
+        return any(re.search(p, text) for p in patterns)

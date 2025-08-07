@@ -1,5 +1,5 @@
 # File: scripts/ingest_pdf_compare.py
-
+'''
 import asyncio
 import sys
 from app.utils.pdf_utils import extract_chunks_from_pdf
@@ -33,3 +33,4 @@ async def main(pdf_path: str):
 if __name__ == "__main__":
     pdf = sys.argv[1]
     asyncio.run(main(pdf))
+'''

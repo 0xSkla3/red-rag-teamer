@@ -7,6 +7,9 @@ from typing import List, Dict
 from app.utils.logger import setup_logger
 from app.utils.chunk_strategies import ChunkStrategy
 
+import fitz  # PyMuPDF
+
+
 logger = setup_logger(__name__)
 
 async def extract_chunks_from_pdf(
@@ -62,3 +65,12 @@ async def extract_chunks_from_pdf(
         logger.info(f"🏁 Extraction completed | total chunks: {len(docs)} | final RSS: {final_rss:.1f} MB")
 
     return docs
+
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extrae texto de un archivo PDF"""
+    text = ""
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            text += page.get_text()
+    return text

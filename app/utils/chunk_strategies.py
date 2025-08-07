@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 from nltk.tokenize import sent_tokenize
+from sentence_transformers import SentenceTransformer
+
 
 class ChunkStrategy(ABC):
     @abstractmethod
@@ -17,50 +19,60 @@ class ChunkStrategy(ABC):
 
 class AgenticChunking(ChunkStrategy):
     """
-    Chunking inteligente que utiliza LLMs para determinar los puntos óptimos de división
-    basado en contenido técnico de seguridad.
+    Chunking inteligente usando embeddings para determinar puntos óptimos
     """
-    def __init__(self, model_name: str = "mistral", device: str = "cuda", 
-                 min_chunk_size: int = 300, max_chunk_size: int = 1500):
+    def __init__(self, embedding_model_name: str = "BAAI/bge-large-en-v1.5", 
+                 device: str = "cuda", 
+                 min_chunk_size: int = 300, 
+                 max_chunk_size: int = 1500):
         self.device = device
         self.min_size = min_chunk_size
         self.max_size = max_chunk_size
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(device)
+        self.model = SentenceTransformer(embedding_model_name, device=device)
         
+        # Textos de referencia para clasificación
+        self.reference_texts = {
+            "exploit": "Exploit code, shellcode, ROP, payload, vulnerability, CVE, buffer overflow, memory corruption",
+            "code": "Source code, programming, function, class, import, include, def, struct, software development",
+            "manual": "Technical manual, documentation, guide, section, chapter, header, tutorial, explanation"
+        }
+        # Precalcular embeddings de referencia
+        self.ref_embeddings = {}
+        texts = list(self.reference_texts.values())
+        embeddings = self.model.encode(texts, convert_to_numpy=True)
+        for i, cat in enumerate(self.reference_texts.keys()):
+            self.ref_embeddings[cat] = embeddings[i]
+
     def chunk(self, text: str) -> List[str]:
-        # Paso 1: Análisis de tipo de contenido con LLM
+        # Paso 1: Análisis de tipo de contenido
         content_type = self._analyze_content_type(text)
         
         # Paso 2: Selección de estrategia basada en tipo de contenido
-        if "exploit" in content_type or "shellcode" in content_type:
+        if content_type == "exploit":
             return self._chunk_exploits(text)
-        elif "code" in content_type:
+        elif content_type == "code":
             return self._chunk_code(text)
-        elif "manual" in content_type:
+        elif content_type == "manual":
             return self._chunk_manual(text)
         else:
             return self._chunk_generic(text)
     
     def _analyze_content_type(self, text: str) -> str:
-        """Clasifica el contenido usando embedding + heurísticas"""
-        # Embedding rápido del texto
-        inputs = self.tokenizer(
-            text[:512], 
-            return_tensors="pt", 
-            truncation=True
-        ).to(self.device)
-        with torch.no_grad():
-            embedding = self.model(**inputs).last_hidden_state.mean(dim=1)
+        """Clasifica el contenido usando similitud semántica"""
+        # Embed el texto (primeros 512 caracteres para eficiencia)
+        emb = self.model.encode([text[:512]], convert_to_numpy=True)[0]
         
-        # Heurísticas basadas en patrones
-        if re.search(r'\b(exploit|shellcode|ROP|payload)\b', text, re.IGNORECASE):
-            return "exploit"
-        elif re.search(r'\b(def |function |class |import |#include)\b', text):
-            return "code"
-        elif re.search(r'^# |^## |^### ', text):
-            return "manual"
-        return "generic"
+        # Calcular similitud con categorías de referencia
+        best_cat = "generic"
+        best_score = -1
+        
+        for cat, ref_emb in self.ref_embeddings.items():
+            score = np.dot(emb, ref_emb) / (np.linalg.norm(emb) * np.linalg.norm(ref_emb))
+            if score > best_score:
+                best_score = score
+                best_cat = cat
+        
+        return best_cat
     
     def _chunk_exploits(self, text: str) -> List[str]:
         """División especializada para exploits manteniendo técnicas completas"""
@@ -130,24 +142,19 @@ class AgenticChunking(ChunkStrategy):
 
 class HierarchicalChunkStrategy(ChunkStrategy):
     """
-    Chunking basado en estructura jerárquica con soporte para PDFs y texto.
-    Versión optimizada para documentos técnicos de seguridad.
+    Chunking basado en estructura jerárquica (solo texto)
     """
     def __init__(
         self,
         header_patterns: List[str] = None,
-        pdf_heading_factor: float = 1.3,
         min_chunk_size: int = 350
     ):
         self.header_patterns = header_patterns or [r'^# ', r'^## ', r'^### ']
         self.compiled_patterns = [re.compile(p) for p in self.header_patterns]
-        self.pdf_heading_factor = pdf_heading_factor
         self.min_size = min_chunk_size
 
-    def chunk(self, input_data: Union[str, bytes]) -> List[str]:
-        if isinstance(input_data, str) and input_data.lower().endswith(".pdf"):
-            return self._chunk_pdf(input_data)
-        return self._chunk_text(input_data)
+    def chunk(self, text: str) -> List[str]:
+        return self._chunk_text(text)
 
     def _chunk_text(self, text: str) -> List[str]:
         chunks = []
@@ -163,28 +170,6 @@ class HierarchicalChunkStrategy(ChunkStrategy):
                     current += '\n' + line if current else line
             else:
                 current += '\n' + line if current else line
-        if current and len(current) >= self.min_size:
-            chunks.append(current)
-        return chunks
-
-    def _chunk_pdf(self, pdf_path: str) -> List[str]:
-        """Extracción optimizada para manuales técnicos en PDF"""
-        doc = fitz.open(pdf_path)
-        chunks = []
-        current = ""
-        
-        for page in doc:
-            text = page.get_text("text")
-            for line in text.split('\n'):
-                if any(p.match(line) for p in self.compiled_patterns):
-                    if current and len(current) >= self.min_size:
-                        chunks.append(current)
-                        current = line
-                    else:
-                        current += '\n' + line if current else line
-                else:
-                    current += '\n' + line if current else line
-        
         if current and len(current) >= self.min_size:
             chunks.append(current)
         return chunks

@@ -2,11 +2,12 @@
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import PointStruct
 from typing import List, Dict, Any, Optional, Tuple
 from app.config import settings
 from app.utils.logger import setup_logger
 import time
+import logging
 
 logger = setup_logger(__name__)
 
@@ -14,47 +15,48 @@ class QdrantClientWrapper:
     def __init__(self):
         self.client = QdrantClient(
             url=settings.QDRANT_URL,
-            prefer_grpc=False,
+            prefer_grpc=settings.QDRANT_USE_GRPC,
             timeout=settings.QDRANT_TIMEOUT
         )
         self.collection_name = settings.RAG_COLLECTION
         self._ensure_collection()
-        logger.info(f"Connected to Qdrant at '{settings.QDRANT_URL}', collection '{self.collection_name}'")
+        logger.info(f"Conectado a Qdrant en '{settings.QDRANT_URL}', colección '{self.collection_name}'")
 
     def _ensure_collection(self) -> None:
-        """Crea la colección si no existe con configuración optimizada para seguridad informática"""
+        """Crea la colección si no existe con configuración optimizada"""
         try:
-            # Verificar si la colección ya existe
             self.client.get_collection(self.collection_name)
         except (UnexpectedResponse, ValueError):
-            # Crear colección con configuración optimizada
+            hnsw_config = models.HnswConfigDiff(
+                m=48,  # Mayor conectividad para precisión
+                ef_construct=300,
+                payload_indexing_threshold=100
+            )
+            
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=models.VectorParams(
                     size=settings.EMBEDDING_DIM,
                     distance=models.Distance.COSINE,
-                    on_disk=True  # Para grandes volúmenes
+                    on_disk=True
                 ),
+                hnsw_config=hnsw_config,
                 optimizers_config=models.OptimizersConfigDiff(
-                    indexing_threshold=0,  # Indexar inmediatamente
-                    memmap_threshold=10000  # Usar memoria mapeada
-                ),
-                hnsw_config=models.HnswConfigDiff(
-                    m=32,  # Mayor conectividad para precisión
-                    ef_construct=200,  # Construcción más precisa
-                    payload_indexing_threshold=50  # Indexar payloads pequeños
+                    indexing_threshold=0,
+                    memmap_threshold=5000
                 )
             )
-            logger.info(f"Created new collection: '{self.collection_name}'")
-            
-            # Crear índices de payload para búsquedas técnicas rápidas
+            logger.info(f"Colección creada: '{self.collection_name}'")
             self._create_payload_indexes()
 
     def _create_payload_indexes(self) -> None:
-        """Crea índices para campos técnicos comunes"""
+        """Crea índices para campos técnicos basados en nuestra metadata"""
         index_fields = [
-            "doc_type", "platform", "cve", "risk_level", "is_technical"
+            "content_type", 
+            "source_file",
+            "tech_keywords"
         ]
+        
         for field in index_fields:
             try:
                 self.client.create_payload_index(
@@ -62,41 +64,46 @@ class QdrantClientWrapper:
                     field_name=field,
                     field_schema=models.PayloadSchemaType.KEYWORD
                 )
-                logger.debug(f"Created payload index for: {field}")
+                logger.debug(f"Índice creado para: {field}")
             except Exception as e:
-                logger.warning(f"Failed to create index for {field}: {str(e)}")
+                logger.warning(f"Error creando índice para {field}: {str(e)}")
 
     def search(
         self, 
         embedding: List[float], 
         top_k: int,
-        technical_only: bool = True,
-        filters: Optional[Dict[str, Any]] = None
+        content_type: Optional[str] = None,
+        source_file: Optional[str] = None,
+        min_score: float = 0.7
     ) -> List[Dict[str, Any]]:
         """
-        Búsqueda con filtros para contenido técnico de seguridad
+        Búsqueda optimizada con filtros para seguridad ofensiva
         
         Args:
-            embedding: Vector de consulta
+            embedding: Vector de búsqueda
             top_k: Número de resultados
-            technical_only: Filtrar solo contenido técnico
-            filters: Filtros adicionales (ej: {"platform": "Windows"})
+            content_type: Filtrar por tipo (exploit, code, manual, etc.)
+            source_file: Filtrar por documento fuente
+            min_score: Umbral mínimo de similitud
         """
-        # Construir filtro compuesto
+        # Construir filtros
         must_conditions = []
         
-        if technical_only:
+        if content_type:
             must_conditions.append(
-                FieldCondition(key="is_technical", match=MatchValue(value=True))
+                models.FieldCondition(
+                    key="content_type",
+                    match=models.MatchValue(value=content_type)
+            ))
         
-        if filters:
-            for key, value in filters.items():
-                must_conditions.append(
-                    FieldCondition(key=key, match=MatchValue(value=value)))
+        if source_file:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="source_file",
+                    match=models.MatchValue(value=source_file)
+            ))
         
-        query_filter = Filter(must=must_conditions) if must_conditions else None
-        
-        logger.debug(f"Searching with filter: {query_filter}")
+        query_filter = models.Filter(must=must_conditions) if must_conditions else None
         
         # Búsqueda con parámetros optimizados
         start_time = time.time()
@@ -107,8 +114,9 @@ class QdrantClientWrapper:
             limit=top_k,
             with_payload=True,
             with_vectors=False,
+            score_threshold=min_score,
             search_params=models.SearchParams(
-                hnsw_ef=128,  # Mayor precisión en recuperación
+                hnsw_ef=200,  # Mayor precisión
                 exact=False
             )
         )
@@ -116,50 +124,18 @@ class QdrantClientWrapper:
         # Procesar resultados
         results = []
         for hit in hits:
-            result = {
+            results.append({
                 "id": hit.id,
                 "score": hit.score,
                 "content": hit.payload.get("content", ""),
                 "metadata": hit.payload.get("metadata", {})
-            }
-            results.append(result)
+            })
         
         latency = (time.time() - start_time) * 1000
-        logger.info(f"Search returned {len(results)} results in {latency:.2f}ms")
+        logger.info(f"Búsqueda retornó {len(results)} resultados en {latency:.2f}ms")
         return results
 
-    def upsert(
-        self, 
-        ids: List[str],
-        vectors: List[List[float]],
-        payloads: List[Dict[str, Any]]
-    ) -> None:
-        """Upsert con manejo de errores y reintentos"""
-        points = [
-            PointStruct(id=doc_id, vector=vec, payload=payload)
-            for doc_id, vec, payload in zip(ids, vectors, payloads)
-        ]
-        
-        # Intentar hasta 3 veces con backoff
-        for attempt in range(3):
-            try:
-                operation_response = self.client.upsert(
-                    collection_name=self.collection_name,
-                    points=points,
-                    wait=True  # Esperar confirmación
-                )
-                if operation_response.status == models.UpdateStatus.COMPLETED:
-                    logger.info(f"Upserted {len(points)} documents successfully")
-                    return
-                else:
-                    logger.warning(f"Upsert partially failed: {operation_response.status}")
-            except Exception as e:
-                logger.error(f"Upsert attempt {attempt+1} failed: {str(e)}")
-                time.sleep(1.5 ** attempt)  # Backoff exponencial
-        
-        logger.error(f"Failed to upsert {len(points)} documents after 3 attempts")
-
-    def batch_upsert(
+    def upsert_batch(
         self,
         documents: List[Dict[str, Any]],
         batch_size: int = 100
@@ -169,48 +145,64 @@ class QdrantClientWrapper:
         
         Args:
             documents: Lista de documentos con estructura:
-                { "id": str, "vector": List[float], "payload": dict }
-            batch_size: Tamaño de lote para upsert
-        
-        Returns:
-            (success_count, error_count)
+                {
+                    "id": str, 
+                    "vector": List[float], 
+                    "payload": {
+                        "content": str,
+                        "metadata": dict
+                    }
+                }
         """
         success = 0
         errors = 0
         total = len(documents)
         
-        logger.info(f"Starting batch upsert of {total} documents in batches of {batch_size}")
+        logger.info(f"Iniciando upsert masivo de {total} documentos")
         
         for i in range(0, total, batch_size):
             batch = documents[i:i+batch_size]
+            points = [
+                PointStruct(
+                    id=doc["id"],
+                    vector=doc["vector"],
+                    payload=doc["payload"]
+                ) for doc in batch
+            ]
+            
             try:
                 self.client.upsert(
                     collection_name=self.collection_name,
-                    points=[
-                        PointStruct(
-                            id=doc["id"],
-                            vector=doc["vector"],
-                            payload=doc["payload"]
-                        ) for doc in batch
-                    ],
+                    points=points,
                     wait=False  # No esperar confirmación para mejor rendimiento
                 )
                 success += len(batch)
-                logger.debug(f"Submitted batch {i//batch_size+1}/{(total-1)//batch_size+1}")
+                logger.debug(f"Batch {i//batch_size+1}/{(total-1)//batch_size+1} enviado")
             except Exception as e:
                 errors += len(batch)
-                logger.error(f"Batch upsert failed: {str(e)}")
+                logger.error(f"Error en batch: {str(e)}")
+                # Reintentar una vez
+                try:
+                    self.client.upsert(
+                        collection_name=self.collection_name,
+                        points=points,
+                        wait=True
+                    )
+                    success += len(batch)
+                    logger.info("Reintento exitoso")
+                except Exception as retry_ex:
+                    logger.error(f"Error en reintento: {str(retry_ex)}")
         
-        # Forzar sincronización al final
+        # Sincronizar cambios
         self.client.update_collection(
             collection_name=self.collection_name,
             optimizers_config=models.OptimizersConfigDiff(
-                indexing_threshold=10000,
-                flush_interval_sec=5
+                indexing_threshold=20000,
+                flush_interval_sec=10
             )
         )
         
-        logger.info(f"Batch upsert completed: {success} succeeded, {errors} failed")
+        logger.info(f"Upsert masivo completado: {success} exitosos, {errors} fallidos")
         return success, errors
 
     def get_collection_stats(self) -> Dict[str, Any]:
@@ -222,8 +214,11 @@ class QdrantClientWrapper:
                 "segments_count": len(collection_info.persisted_segments),
                 "status": collection_info.status,
                 "indexed_vectors": collection_info.indexed_vectors_count,
-                "config": collection_info.config.dict()
+                "config": {
+                    "hnsw": collection_info.config.hnsw_config.dict(),
+                    "optimizer": collection_info.config.optimizer_config.dict()
+                }
             }
         except Exception as e:
-            logger.error(f"Failed to get collection stats: {str(e)}")
+            logger.error(f"Error obteniendo estadísticas: {str(e)}")
             return {}
