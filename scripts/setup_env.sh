@@ -14,7 +14,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 
 # 4) Instalar dependencias
-pip install --no-cache-dir -r app/requirements.txt
+pip install --no-cache-dir -r app/requirements-cpu.txt
 
 echo "-> Entorno virtual creado y dependencias instaladas."
 

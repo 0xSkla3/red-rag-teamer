@@ -1,57 +1,94 @@
-#app/factories.py
-from .chunk_strategies import (
-    SemanticChunkStrategy, TopicChunkStrategy, AstChunkStrategy,
-    JsonChunkStrategy, LogChunkStrategy, SlidingWindowStrategy,
-    CompositeChunkStrategy, HierarchicalChunkStrategy, LateChunkingDecorator
+#File: app/factories.py|
+from __future__ import annotations
+
+from typing import Optional
+from app.utils.logger import setup_logger
+from app.config import settings
+
+from app.utils.chunk_strategies import (
+    ChunkStrategy,
+    AgenticChunking,
 )
-from .chunk_handlers import (
-    HierarchicalChunkHandler, CodeChunkHandler, JsonChunkHandler, 
-    LogChunkHandler, TextChunkHandler, ExploitPayloadHandler, AssemblyHandler
+from app.utils.chunk_decorators import (
+    TechnicalChunkOptimizer,
+    LateChunkingDecorator,
+    AstFallbackDecorator,
 )
-from .pipeline import BaseChunkPipeline
 
-class ChunkStrategyFactory:
-    @staticmethod
-    def get_strategy(name: str, **kwargs) -> IChunkStrategy:
-        strategies = {
-            'semantic': lambda: SemanticChunkStrategy(
-                kwargs.get('model_name', 'all-MiniLM-L6-v2'),
-                kwargs.get('device', 'cpu'),
-                kwargs.get('similarity_threshold', 0.75)
-            ),
-            'ast': lambda: AstChunkStrategy(kwargs.get('language', 'python')),
-            'json': JsonChunkStrategy,
-            'log': lambda: LogChunkStrategy(kwargs.get('timestamp_pattern')),
-            'hierarchical': lambda: HierarchicalChunkStrategy(
-                kwargs.get('header_patterns', ['^# ', '^## ', '^### '])
-            ),
-            'sliding': lambda: SlidingWindowStrategy(
-                kwargs.get('window_size', 512),
-                kwargs.get('overlap', 0.1)
-            ),
-            'composite': lambda: CompositeChunkStrategy(
-                [ChunkStrategyFactory.get_strategy(s) for s in kwargs.get('strategies', [])]
-            ),
-            'late': lambda: LateChunkingDecorator(
-                kwargs['wrapped'],
-                kwargs.get('context_model_name', 'all-mpnet-base-v2'),
-                kwargs.get('device', 'cpu')
-            )
-        }
-        return strategies[name]()
+logger = setup_logger(__name__, level=getattr(settings, "LOG_LEVEL", "INFO"))
 
-class ChunkPipelineBuilder:
-    def __init__(self):
-        self.handlers = []
 
-    def add_handler(self, handler: ChunkHandler) -> 'ChunkPipelineBuilder':
-        self.handlers.append(handler)
-        return self
+def build_strategy_pipeline(
+    *,
+    model_name: str,
+    device: str,
+    min_chunk_size: int,
+    max_chunk_size: int,
+    batch_size: int,
+    late_threshold: float,
+    use_ast: bool = False,
+    normalize_embeddings: bool = True,
+    prompt_name: str = "document",
+) -> ChunkStrategy:
+    """
+    Construye el pipeline de chunking compuesto:
+      [AST opcional (fallback)] -> AgenticChunking -> TechnicalChunkOptimizer -> LateChunkingDecorator
 
-    def build(self) -> BaseChunkPipeline:
-        chain = None
-        for handler in reversed(self.handlers):
-            if chain:
-                handler.next = chain
-            chain = handler
-        return BaseChunkPipeline(chain)
+    - AST se aplica como *fallback*: si detecta código y produce cortes válidos, se usa;
+      de lo contrario, cae al agentic.
+    - LateChunking usa embeddings (ST v5) para fusionar semánticamente chunks adyacentes O(n).
+
+    Args:
+        model_name: modelo de embeddings para agentic/late (ej. BAAI/bge-large-en-v1.5)
+        device: 'cpu' | 'cuda'
+        min_chunk_size, max_chunk_size: límites de chunking
+        batch_size: batch para embeddings internos (late/agentic)
+        late_threshold: umbral de similitud para fusionar en late
+        use_ast: si True, aplica AST como primera pasada (fallback)
+        normalize_embeddings: normalizar embeddings (recomendado)
+        prompt_name: 'document' o el que corresponda en ST v5
+
+    Returns:
+        ChunkStrategy compuesto listo para usar.
+    """
+    logger.info(
+        "⛏️  Building chunk pipeline: model=%s device=%s min=%d max=%d batch=%d late_thr=%.3f ast=%s",
+        model_name, device, min_chunk_size, max_chunk_size, batch_size, late_threshold, use_ast,
+    )
+
+    base: ChunkStrategy = AgenticChunking(
+        embedding_model_name=model_name,
+        device=device,
+        min_chunk_size=min_chunk_size,
+        max_chunk_size=max_chunk_size,
+        batch_size=batch_size,
+        normalize_embeddings=normalize_embeddings,
+        prompt_name=prompt_name,
+    )
+
+    if use_ast:
+        # Intenta cortar con AST si conviene; si no, cae al agentic interno
+        base = AstFallbackDecorator(
+            wrapped=base,
+            min_size=min_chunk_size,
+            max_size=max_chunk_size,
+        )
+
+    tech = TechnicalChunkOptimizer(
+        wrapped=base,
+        min_size=min_chunk_size,
+        max_size=max_chunk_size,
+    )
+
+    late = LateChunkingDecorator(
+        wrapped=tech,
+        model_name=model_name,
+        device=device,
+        similarity_threshold=late_threshold,
+        batch_size=batch_size,
+        normalize_embeddings=normalize_embeddings,
+        prompt_name=prompt_name,
+    )
+
+    logger.info("✅ Chunk pipeline listo")
+    return late

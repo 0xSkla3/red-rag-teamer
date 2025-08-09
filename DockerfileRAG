@@ -1,39 +1,71 @@
-# Dockerfile (en la raíz del repo)
-# ------------------------------------------------------------
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1.6
+
+# ============================================
+# Base: Python 3.12 (slim)
+# ============================================
+FROM python:3.12-slim AS base
 
 LABEL maintainer="you@domain.com" \
-      version="1.0.0"
+      org.opencontainers.image.title="red-rag-teamer" \
+      org.opencontainers.image.description="RAG service (CPU/GPU profiles) with robust PDF ingestion" \
+      org.opencontainers.image.version="1.0.0"
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
+# ------- Build args para perfilar instalación -------
+# TARGET=cpu|gpu decide qué requirements copiar
+ARG TARGET=cpu
+# (Opcional) metadata de endpoints externos
 ARG OLLAMA_URL=http://localhost:11434
 ARG QDRANT_URL=http://localhost:6333
 
-# 1) Dependencias del sistema
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential \
-      curl \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-# 2) Instala dependencias Python
-COPY app/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ============================================
+# Sistema: mínimos + tini + curl
+# ============================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      tini \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# 3) Copia el código de la app
-COPY app/ ./app
+# ============================================
+# Dependencias Python (aprovechar cache)
+# ============================================
+# Copiamos sólo requirements para cachear pip install
+COPY app/requirements-${TARGET}.txt /app/requirements.txt
 
-# 4) Crea usuario no-root para correr el servicio
+# Upgrade pip/setuptools/wheel + cache mount de pip (BuildKit) para acelerar rebuilds
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip setuptools wheel && \
+    pip install -r /app/requirements.txt
+
+# ============================================
+# Usuario no-root (antes de copiar código)
+# ============================================
 RUN useradd -ms /bin/bash appuser
+
+# ============================================
+# Copiar código ya filtrado por .dockerignore
+# Usamos --chown para evitar el costoso 'chown -R' en runtime
+# ============================================
+COPY --chown=appuser:appuser app/ /app/app
+
 USER appuser
 
-# 5) Healthcheck
+# ============================================
+# Healthcheck + Expose
+# ============================================
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD curl -f http://localhost:5000/health || exit 1
+  CMD curl -fsS http://localhost:5000/health || exit 1
 
 EXPOSE 5000
 
-# 6) Inicio del server
+# ============================================
+# Entrypoint + CMD
+# ============================================
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5000"]

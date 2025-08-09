@@ -5,6 +5,42 @@ networks:
     driver: bridge
 
 services:
+  ollama:
+    container_name: ollama
+    build:
+      context: .
+      dockerfile: DockerfileLLM
+    # Para Docker Compose local:
+    gpus: all
+    # Para Swarm (opcional, si lo usás):
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - OLLAMA_MAX_GPU_MEM=14GB
+      - OLLAMA_ORIGINS=http://rag-service:5000
+    volumes:
+      - ollama-models:/home/app/.ollama/models
+    ports:
+      - "11434:11434"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    networks:
+      - rag_network
 
   qdrant:
     container_name: qdrant
@@ -34,12 +70,12 @@ services:
       context: .
       dockerfile: DockerfileRAG
     depends_on:
-      #- ollama
+      - ollama
       - qdrant
     environment:
       - OLLAMA_URL=http://ollama:11434
       - QDRANT_URL=http://qdrant:6333
-      - RAG_PROFILE=vm          # usa embeddings/params de perfil CPU
+      - RAG_PROFILE=host        # usa embeddings/params de perfil GPU
       # - QDRANT_USE_GRPC=True  # si exponés 6334 y querés gRPC
     ports:
       - "5000:5000"

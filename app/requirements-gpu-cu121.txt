@@ -1,0 +1,59 @@
+# === Runtime target: GPU CUDA 12.1 (Python 3.12) ===
+
+# Core framework
+fastapi>=0.109.0,<1.0
+uvicorn[standard]>=0.24.0,<1.0
+httpx>=0.24.1,<1.0
+anyio>=3.7.0,<5.0
+pydantic>=2.6.0,<3.0
+pydantic-settings>=2.2.0,<3.0
+
+# Vector DB client
+qdrant-client>=1.9.0,<2.0
+
+# Logging / UX
+rich>=13.7.0,<14.0
+
+# PDF & utils
+pdfplumber>=0.10.3,<1.0
+PyMuPDF>=1.24.0,<2.0
+psutil>=5.9.0,<6.0
+tqdm>=4.66.0,<5.0
+
+# NLP / Embeddings
+numpy>=1.24.0,<2.0
+nltk>=3.8.1,<4.0
+gensim>=4.3.0,<5.0
+transformers>=4.41.0,<5.0
+sentence-transformers>=3.0.0,<4.0
+
+# Torch (CUDA 12.1 wheels)
+-f https://download.pytorch.org/whl/cu121
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+torchaudio==2.4.1+cu121
+
+# AST / code handling
+
+pygments>=2.16.0,<3.0
+
+
+
+# Parser core
+tree-sitter==0.25.1
+
+# Grammars oficiales (agregá/quitá según lo que realmente uses)
+tree-sitter-python==0.23.6
+tree-sitter-javascript==0.23.1
+tree-sitter-typescript==0.23.2   # provee TypeScript; para TSX ver línea siguiente
+tree-sitter-tsx==0.23.0          # TSX como paquete separado
+tree-sitter-c==0.24.1
+tree-sitter-cpp==0.23.4
+tree-sitter-java==0.23.5
+tree-sitter-go==0.23.4
+tree-sitter-rust==0.24.0
+tree-sitter-bash==0.25.0
+tree-sitter-php==0.23.11
+tree-sitter-ruby==0.23.1
+tree-sitter-c-sharp==0.1.33      # paquete oficial para C# (nomenclatura con guion)
+tree-sitter-json==0.24.8

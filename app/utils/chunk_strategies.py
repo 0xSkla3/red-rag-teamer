@@ -1,53 +1,93 @@
 # File: app/utils/chunk_strategies.py
-from abc import ABC, abstractmethod
-from typing import List, Union, Optional, Dict
-import re
-import json
-import statistics
-import fitz  # PyMuPDF
-import numpy as np
-import torch
-from transformers import AutoTokenizer, AutoModel
-from nltk.tokenize import sent_tokenize
-from sentence_transformers import SentenceTransformer
+from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from typing import List, Optional, Dict, Tuple, Callable
+import re
+import importlib
+import numpy as np
+
+from sentence_transformers import SentenceTransformer
+from tree_sitter import Language, Parser
+
+from app.utils.logger import setup_logger
+from app.config import settings
+
+logger = setup_logger(__name__, level=getattr(settings, "LOG_LEVEL", "INFO"))
+
+
+# ========================= Interfaces base =========================
 
 class ChunkStrategy(ABC):
     @abstractmethod
     def chunk(self, text: str) -> List[str]:
-        pass
+        """Devuelve una lista de chunks de texto."""
+        raise NotImplementedError
+
+
+# ========================= Agentic (embeddings) =========================
 
 class AgenticChunking(ChunkStrategy):
     """
-    Chunking inteligente usando embeddings para determinar puntos óptimos
+    Chunking 'inteligente' con embeddings para clasificar contenido:
+      - exploit / code / manual / genérico
+    Normalización activada (normalize=True) para que dot ≈ cosine.
     """
-    def __init__(self, embedding_model_name: str = "BAAI/bge-large-en-v1.5", 
-                 device: str = "cuda", 
-                 min_chunk_size: int = 300, 
-                 max_chunk_size: int = 1500):
+
+    def __init__(
+        self,
+        embedding_model_name: str = "BAAI/bge-large-en-v1.5",
+        device: str = "cpu",
+        min_chunk_size: int = 300,
+        max_chunk_size: int = 1500,
+        batch_size: int = 32,
+        normalize_embeddings: bool = True,
+        prompt_name: str = "document",
+    ):
         self.device = device
-        self.min_size = min_chunk_size
-        self.max_size = max_chunk_size
+        self.min_size = int(min_chunk_size)
+        self.max_size = int(max_chunk_size)
+        self.batch_size = int(batch_size)
+        self.normalize = bool(normalize_embeddings)
+        self.prompt_name = prompt_name
+
         self.model = SentenceTransformer(embedding_model_name, device=device)
-        
-        # Textos de referencia para clasificación
-        self.reference_texts = {
-            "exploit": "Exploit code, shellcode, ROP, payload, vulnerability, CVE, buffer overflow, memory corruption",
-            "code": "Source code, programming, function, class, import, include, def, struct, software development",
-            "manual": "Technical manual, documentation, guide, section, chapter, header, tutorial, explanation"
+        logger.info("AgenticChunking model loaded '%s' on %s", embedding_model_name, device)
+
+        self.has_doc_prompt = (
+            hasattr(self.model, "prompts")
+            and isinstance(self.model.prompts, dict)
+            and ("document" in self.model.prompts or "passage" in self.model.prompts)
+        )
+
+        self.reference_texts: Dict[str, str] = {
+            "exploit": "Exploit code, shellcode, ROP, payload, vulnerability, CVE, buffer overflow, memory corruption.",
+            "code":    "Source code, programming, function, class, import, include, def, struct, software development.",
+            "manual":  "Technical manual, documentation, guide, section, chapter, header, tutorial, explanation.",
         }
-        # Precalcular embeddings de referencia
-        self.ref_embeddings = {}
         texts = list(self.reference_texts.values())
-        embeddings = self.model.encode(texts, convert_to_numpy=True)
-        for i, cat in enumerate(self.reference_texts.keys()):
-            self.ref_embeddings[cat] = embeddings[i]
+        embeddings = self._encode_doc(texts)
+        self.ref_embeddings: Dict[str, np.ndarray] = {
+            cat: embeddings[i] for i, cat in enumerate(self.reference_texts.keys())
+        }
+        logger.debug("AgenticChunking reference embeddings computed (%d)", len(texts))
+
+    def _encode_doc(self, texts) -> np.ndarray:
+        if isinstance(texts, str):
+            texts = [texts]
+        if self.has_doc_prompt:
+            pn = "document" if "document" in self.model.prompts else "passage"
+            return self.model.encode(
+                texts, prompt_name=pn, normalize_embeddings=self.normalize, convert_to_numpy=True
+            )
+        return self.model.encode(texts, normalize_embeddings=self.normalize, convert_to_numpy=True)
 
     def chunk(self, text: str) -> List[str]:
-        # Paso 1: Análisis de tipo de contenido
+        if not text or not text.strip():
+            return []
         content_type = self._analyze_content_type(text)
-        
-        # Paso 2: Selección de estrategia basada en tipo de contenido
+        logger.debug("Agentic content type=%s", content_type)
+
         if content_type == "exploit":
             return self._chunk_exploits(text)
         elif content_type == "code":
@@ -56,286 +96,393 @@ class AgenticChunking(ChunkStrategy):
             return self._chunk_manual(text)
         else:
             return self._chunk_generic(text)
-    
+
     def _analyze_content_type(self, text: str) -> str:
-        """Clasifica el contenido usando similitud semántica"""
-        # Embed el texto (primeros 512 caracteres para eficiencia)
-        emb = self.model.encode([text[:512]], convert_to_numpy=True)[0]
-        
-        # Calcular similitud con categorías de referencia
+        sample = (text or "")[:1024]
+        if not sample:
+            return "generic"
+
+        emb = self._encode_doc(sample)
+        if isinstance(emb, np.ndarray) and emb.ndim == 2:
+            emb = emb[0]
+
         best_cat = "generic"
-        best_score = -1
-        
-        for cat, ref_emb in self.ref_embeddings.items():
-            score = np.dot(emb, ref_emb) / (np.linalg.norm(emb) * np.linalg.norm(ref_emb))
+        best_score = -1.0
+        for cat, ref in self.ref_embeddings.items():
+            try:
+                score = float(np.dot(emb, ref))
+            except Exception:
+                score = -1.0
             if score > best_score:
                 best_score = score
                 best_cat = cat
-        
+        logger.debug("Agentic classify: %s (%.3f)", best_cat, best_score)
         return best_cat
-    
+
+    # ---- Estrategias por tipo ----
+
     def _chunk_exploits(self, text: str) -> List[str]:
-        """División especializada para exploits manteniendo técnicas completas"""
-        # 1. Identificar secciones técnicas
-        sections = re.split(r'(### Technique:|### Exploit Code:|### Proof of Concept)', text)
-        
-        # 2. Fusionar secciones relacionadas
-        chunks = []
+        sections = re.split(r"(###\s*Technique:|###\s*Exploit Code:|###\s*Proof of Concept)", text)
+        chunks: List[str] = []
         current = ""
         for section in sections:
-            if len(current) + len(section) < self.max_size:
-                current += section
+            if not section:
+                continue
+            if len(current) + len(section) <= self.max_size:
+                current = f"{current}{section}" if current else section
             else:
-                if current: chunks.append(current)
+                if current:
+                    chunks.append(current)
                 current = section
-        if current: chunks.append(current)
-        
+        if current:
+            chunks.append(current)
         return chunks
-    
+
     def _chunk_code(self, text: str) -> List[str]:
-        """Chunking para código preservando funciones completas"""
-        chunks = []
+        chunks: List[str] = []
         current = ""
-        lines = text.split('\n')
-        
-        for line in lines:
-            # Detectar inicio de función/clase
-            if re.match(r'^\s*(def |class |function )', line) and current:
+        for line in text.split("\n"):
+            if re.match(r"^\s*(def |class |function )", line) and current:
                 chunks.append(current)
                 current = line
             else:
-                if len(current) + len(line) < self.max_size:
-                    current += '\n' + line
+                if len(current) + len(line) + 1 <= self.max_size:
+                    current = (current + "\n" + line) if current else line
                 else:
-                    if current: chunks.append(current)
+                    if current:
+                        chunks.append(current)
                     current = line
-        if current: chunks.append(current)
+        if current:
+            chunks.append(current)
         return chunks
-    
+
     def _chunk_manual(self, text: str) -> List[str]:
-        """Chunking jerárquico para manuales técnicos"""
-        chunks = []
+        chunks: List[str] = []
         current = ""
-        lines = text.split('\n')
-        
-        for line in lines:
-            if re.match(r'^#+ ', line) and current:
+        for line in text.split("\n"):
+            if re.match(r"^#+\s+", line) and current:
                 chunks.append(current)
                 current = line
             else:
-                current += '\n' + line
-        if current: chunks.append(current)
+                current = (current + "\n" + line) if current else line
+            if len(current) >= self.max_size:
+                chunks.append(current)
+                current = ""
+        if current:
+            chunks.append(current)
         return chunks
-    
+
     def _chunk_generic(self, text: str) -> List[str]:
-        """Fallback para contenido genérico"""
-        chunks = []
+        chunks: List[str] = []
         current = ""
-        for paragraph in text.split('\n\n'):
-            if len(current) + len(paragraph) < self.max_size:
-                current += '\n\n' + paragraph if current else paragraph
+        for paragraph in text.split("\n\n"):
+            if not paragraph:
+                continue
+            if len(current) + len(paragraph) + 2 <= self.max_size:
+                current = f"{current}\n\n{paragraph}" if current else paragraph
             else:
-                if current: chunks.append(current)
+                if current:
+                    chunks.append(current)
                 current = paragraph
-        if current: chunks.append(current)
+        if current:
+            chunks.append(current)
         return chunks
+
+
+# ========================= Jerárquico simple =========================
 
 class HierarchicalChunkStrategy(ChunkStrategy):
-    """
-    Chunking basado en estructura jerárquica (solo texto)
-    """
-    def __init__(
-        self,
-        header_patterns: List[str] = None,
-        min_chunk_size: int = 350
-    ):
-        self.header_patterns = header_patterns or [r'^# ', r'^## ', r'^### ']
+    def __init__(self, header_patterns: Optional[List[str]] = None, min_chunk_size: int = 350):
+        self.header_patterns = header_patterns or [r"^# ", r"^## ", r"^### "]
         self.compiled_patterns = [re.compile(p) for p in self.header_patterns]
-        self.min_size = min_chunk_size
+        self.min_size = int(min_chunk_size)
 
     def chunk(self, text: str) -> List[str]:
-        return self._chunk_text(text)
-
-    def _chunk_text(self, text: str) -> List[str]:
-        chunks = []
+        chunks: List[str] = []
         current = ""
-        lines = text.split('\n')
-        
-        for line in lines:
+        for line in text.split("\n"):
             if any(p.match(line) for p in self.compiled_patterns):
                 if current and len(current) >= self.min_size:
                     chunks.append(current)
                     current = line
                 else:
-                    current += '\n' + line if current else line
+                    current = (current + "\n" + line) if current else line
             else:
-                current += '\n' + line if current else line
+                current = (current + "\n" + line) if current else line
         if current and len(current) >= self.min_size:
             chunks.append(current)
         return chunks
 
+
+# ========================= AST con Tree-sitter (API 0.25) =========================
+
 class AstChunkStrategy(ChunkStrategy):
     """
-    Chunking basado en AST para múltiples lenguajes con enfoque en seguridad.
-    Soporta: Python, C/C++, Assembly, PowerShell, JavaScript.
+    AST con Tree-Sitter (>=0.25):
+      - Usa paquetes por-lenguaje oficiales (p.ej. tree-sitter-python, ...).
+      - Carga perezosa vía importlib; si un lenguaje no está instalado, devolvemos [text].
+      - Regla de oro: no cortar dentro de funciones/clases; JSON se devuelve completo.
     """
-    def __init__(self, languages: List[str] = None):
-        self.languages = languages or ["python", "c", "cpp", "asm", "powershell", "javascript"]
-        self.parsers = self._init_parsers()
-    
-    def _init_parsers(self) -> Dict:
-        try:
-            from tree_sitter import Language, Parser
-            parser_map = {}
-            for lang in self.languages:
-                try:
-                    language = Language(f'build/{lang}.so', lang)
-                    parser = Parser()
-                    parser.set_language(language)
-                    parser_map[lang] = parser
-                except:
-                    continue
-            return parser_map
-        except ImportError:
-            return {}
+
+    SUPPORTED = (
+        "python","javascript","typescript","tsx","c","cpp","java","go","rust",
+        "bash","php","ruby","c_sharp","json",
+    )
+
+    NODE_MAP: Dict[str, Tuple[str, ...]] = {
+        "python": ("function_definition", "class_definition"),
+        "javascript": ("function_declaration", "method_definition", "class_declaration"),
+        "typescript": ("function_declaration", "method_signature", "class_declaration"),
+        "tsx": ("function_declaration", "method_signature", "class_declaration"),
+        "c": ("function_definition", "struct_specifier"),
+        "cpp": ("function_definition", "class_specifier", "struct_specifier"),
+        "java": ("method_declaration", "class_declaration"),
+        "go": ("function_declaration", "method_declaration", "type_declaration"),
+        "rust": ("function_item", "impl_item", "struct_item"),
+        "bash": ("function_definition",),
+        "php": ("function_declaration", "method_declaration", "class_declaration"),
+        "ruby": ("method", "class"),
+        "c_sharp": ("method_declaration", "class_declaration", "struct_declaration"),
+        "json": (),  # JSON no se corta
+    }
+
+    # Mapa módulo -> callable que retorna el objeto de lenguaje; TS/TSX comparten paquete
+    LANG_SPECS: Dict[str, Tuple[str, str]] = {
+        "python":    ("tree_sitter_python", "language"),
+        "javascript":("tree_sitter_javascript", "language"),
+        "typescript":("tree_sitter_typescript", "language_typescript"),
+        "tsx":       ("tree_sitter_typescript", "language_tsx"),
+        "c":         ("tree_sitter_c", "language"),
+        "cpp":       ("tree_sitter_cpp", "language"),
+        "java":      ("tree_sitter_java", "language"),
+        "go":        ("tree_sitter_go", "language"),
+        "rust":      ("tree_sitter_rust", "language"),
+        "bash":      ("tree_sitter_bash", "language"),
+        "php":       ("tree_sitter_php", "language"),
+        "ruby":      ("tree_sitter_ruby", "language"),
+        "c_sharp":   ("tree_sitter_c_sharp", "language"),
+        "json":      ("tree_sitter_json", "language"),
+    }
+
+    def __init__(self, min_size: int = 80, max_size: int = 10_000):
+        self.min_size = int(min_size)
+        self.max_size = int(max_size)
+        self._parser_cache: Dict[str, Parser] = {}
+        self._warned_langs: set[str] = set()
+
+        logger.info("AstChunkStrategy: Tree-Sitter API 0.25 (Parser(language))")
+
+    # ---------------- API ----------------
 
     def chunk(self, text: str) -> List[str]:
-        lang = self._detect_language(text)
-        if lang not in self.parsers:
+        if not text:
+            return []
+
+        lang = self._auto_detect_language(text)
+        if not lang or lang == "json":
             return [text]
-        
-        tree = self.parsers[lang].parse(bytes(text, "utf-8"))
-        chunks = []
-        self._extract_nodes(tree.root_node, text, chunks, lang)
+
+        parser = self._get_configured_parser(lang)
+        if parser is None:
+            return [text]
+
+        try:
+            tree = parser.parse(bytes(text, "utf-8", errors="ignore"))
+        except Exception as e:
+            self._warn_once(lang, f"parse() failed: {e}")
+            return [text]
+
+        target_nodes = self.NODE_MAP.get(lang, ())
+        if not target_nodes:
+            return [text]
+
+        spans = self._collect_target_spans(tree.root_node, text, target_nodes)
+        if not spans:
+            return [text]
+
+        chunks = self._assemble_chunks_from_spans(spans, text)
         return chunks or [text]
-    
-    def _detect_language(self, text: str) -> str:
-        """Detección de lenguaje basada en patrones de seguridad"""
-        patterns = {
-            "python": r'\b(def |import |from |sys\.|os\.)',
-            "c": r'#include|int main|printf\(',
-            "cpp": r'#include|std::|using namespace',
-            "asm": r'\b(mov |push |call |int 0x80|section)',
-            "powershell": r'\$|Write-Host|Import-Module',
-            "javascript": r'function |console\.|=>'
-        }
-        for lang, pattern in patterns.items():
-            if re.search(pattern, text, re.IGNORECASE):
-                return lang
-        return "python"  # Default
-    
-    def _extract_nodes(self, node, text: str, chunks: List, lang: str, min_size: int = 50):
-        """Extrae nodos técnicamente significativos"""
-        # Definir nodos objetivo por lenguaje
-        target_nodes = {
-            "python": ["function_definition", "class_definition"],
-            "c": ["function_definition", "struct_specifier"],
-            "cpp": ["function_definition", "class_specifier"],
-            "asm": ["function_definition", "instruction"],
-            "powershell": ["function_definition", "cmdlet"],
-            "javascript": ["function_declaration", "class_declaration"]
-        }.get(lang, [])
-        
-        if node.type in target_nodes:
-            chunk = text[node.start_byte:node.end_byte]
-            if len(chunk) > min_size:
-                chunks.append(chunk)
-            return
-        
-        for child in node.children:
-            self._extract_nodes(child, text, chunks, lang, min_size)
 
-class LateChunkingDecorator(ChunkStrategy):
-    """
-    Optimización final de chunks basada en contexto semántico global.
-    Fusiona fragmentos relacionados para mantener técnicas completas.
-    """
-    def __init__(self, wrapped: ChunkStrategy, context_model: str = "BAAI/bge-large-en-v1.5", 
-                 device: str = "cuda", similarity_threshold: float = 0.82):
-        self.wrapped = wrapped
-        self.model_name = context_model
-        self.device = device
-        self.threshold = similarity_threshold
-        self.tokenizer = AutoTokenizer.from_pretrained(context_model)
-        self.model = AutoModel.from_pretrained(context_model).to(device)
-    
-    def chunk(self, text: str) -> List[str]:
-        # 1. Generar chunks base
-        base_chunks = self.wrapped.chunk(text)
-        if len(base_chunks) <= 1:
-            return base_chunks
-        
-        # 2. Embedding de contexto global (modo eficiente)
-        global_embedding = self._embed_text(text[:2048])
-        
-        # 3. Fusionar chunks semánticamente relacionados
-        merged_chunks = []
-        current = base_chunks[0]
-        
-        for next_chunk in base_chunks[1:]:
-            chunk_embedding = self._embed_text(next_chunk[:512])
-            similarity = np.dot(global_embedding, chunk_embedding.T)[0][0]
-            
-            if similarity > self.threshold:
-                current += "\n\n" + next_chunk
-            else:
-                merged_chunks.append(current)
-                current = next_chunk
-                
-        merged_chunks.append(current)
-        return merged_chunks
-    
-    def _embed_text(self, text: str) -> np.ndarray:
-        """Embedding eficiente para fragmentos"""
-        inputs = self.tokenizer(
-            text, 
-            return_tensors="pt", 
-            truncation=True, 
-            max_length=512
-        ).to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+    # ---------------- helpers ----------------
 
-class TechnicalChunkOptimizer(ChunkStrategy):
-    """
-    Optimizador final que aplica reglas específicas para contenido de seguridad:
-    - Fusiona chunks pequeños relacionados
-    - Asegura chunks autocontenidos
-    - Añade contexto técnico
-    """
-    def __init__(self, wrapped: ChunkStrategy, min_size: int = 400):
-        self.wrapped = wrapped
-        self.min_size = min_size
-    
-    def chunk(self, text: str) -> List[str]:
-        chunks = self.wrapped.chunk(text)
-        optimized = []
-        current = ""
-        
-        for chunk in chunks:
-            # Fusionar chunks pequeños técnicamente relacionados
-            if len(current) < self.min_size and self._are_related(current, chunk):
-                current += "\n\n" + chunk if current else chunk
+    def _get_language_callable(self, lang: str) -> Optional[Callable[[], object]]:
+        spec = self.LANG_SPECS.get(lang)
+        if not spec:
+            return None
+        module_name, func_name = spec
+        try:
+            mod = importlib.import_module(module_name)
+            fn = getattr(mod, func_name, None)
+            if fn is None:
+                raise AttributeError(f"{module_name}.{func_name} no encontrado")
+            return fn
+        except Exception as e:
+            self._warn_once(lang, f"no se pudo importar {module_name} ({e})")
+            return None
+
+    def _get_configured_parser(self, lang: str) -> Optional[Parser]:
+        if lang in self._parser_cache:
+            return self._parser_cache[lang]
+        fn = self._get_language_callable(lang)
+        if fn is None:
+            return None
+        try:
+            lang_obj = Language(fn())     # API moderna: construir Language desde callable del paquete
+            parser = Parser(lang_obj)     # API 0.25: constructor recibe language
+            self._parser_cache[lang] = parser
+            return parser
+        except Exception as e:
+            self._warn_once(lang, f"no se pudo configurar parser para {lang} ({e})")
+            return None
+
+    def _warn_once(self, lang: str, msg: str):
+        if lang not in self._warned_langs:
+            logger.warning("AstChunkStrategy: %s", msg)
+            self._warned_langs.add(lang)
+
+    def _auto_detect_language(self, text: str) -> Optional[str]:
+        lang = self._heuristic_lang(text)
+        if lang:
+            return lang
+
+        best_lang = None
+        best_count = 0
+        for candidate in self.SUPPORTED:
+            parser = self._get_configured_parser(candidate)
+            if parser is None:
+                continue
+            try:
+                tree = parser.parse(bytes(text, "utf-8", errors="ignore"))
+                target_nodes = self.NODE_MAP.get(candidate, ())
+                count = self._count_nodes(tree.root_node, target_nodes)
+                if count > best_count:
+                    best_count = count
+                    best_lang = candidate
+            except Exception as e:
+                self._warn_once(candidate, f"parse autodetect failed: {e}")
+                continue
+        logger.debug("AstChunkStrategy autodetect: %s (nodes=%d)", best_lang, best_count)
+        return best_lang
+
+    def _heuristic_lang(self, text: str) -> Optional[str]:
+        if text.startswith("#!/usr/bin/env python") or re.search(r"\bdef\s+\w+\(", text): return "python"
+        if text.startswith("#!/bin/bash") or re.search(r"\bfunction\s+\w+\s*\(|\b\w+\s*\(\)\s*{", text): return "bash"
+        if re.search(r"#include\s*<|int\s+main\s*\(", text): return "c"
+        if re.search(r"using\s+namespace|std::", text): return "cpp"
+        if re.search(r"\bpackage\s+main\b|\bfunc\s+\w+\s*\(", text): return "go"
+        if re.search(r"\bclass\s+\w+|public\s+(class|static|void)", text): return "java"
+        if re.search(r"\bfunction\b|\bclass\s+\w+|\bconsole\.", text): return "javascript"
+        if re.search(r"\binterface\b|\bimplements\b|:\s*\w+\s*=>", text): return "typescript"
+        if re.search(r"\bfn\s+\w+\s*\(", text): return "rust"
+        return None
+
+    def _count_nodes(self, root, target_types: Tuple[str, ...]) -> int:
+        cnt = 0
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type in target_types:
+                cnt += 1
+            stack.extend(node.children)
+        return cnt
+
+    def _collect_target_spans(self, root, text: str, target_types: Tuple[str, ...]) -> List[Tuple[int, int]]:
+        spans: List[Tuple[int, int]] = []
+        candidatas: List[Tuple[int, int]] = []
+
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type in target_types:
+                start = node.start_byte
+                end = node.end_byte
+                start = self._expand_leading_decorators(text, start)
+                start = self._expand_leading_comments(text, start)
+                candidatas.append((start, end))
+            stack.extend(node.children)
+
+        candidatas.sort(key=lambda x: x[0])
+        for s, e in candidatas:
+            if not spans:
+                spans.append((s, e))
+                continue
+            ps, pe = spans[-1]
+            if s <= pe:
+                spans[-1] = (ps, max(pe, e))
             else:
-                if current: optimized.append(self._add_context(current))
-                current = chunk
-        
-        if current: optimized.append(self._add_context(current))
-        return optimized
-    
-    def _are_related(self, chunk1: str, chunk2: str) -> bool:
-        """Determina si dos chunks tratan temas técnicos relacionados"""
-        # Heurísticas simples para evitar dependencias de modelo
-        keywords1 = set(re.findall(r'\b(ROP|ASLR|DEP|shellcode|exploit)\b', chunk1, re.IGNORECASE))
-        keywords2 = set(re.findall(r'\b(ROP|ASLR|DEP|shellcode|exploit)\b', chunk2, re.IGNORECASE))
-        return len(keywords1 & keywords2) > 0
-    
-    def _add_context(self, chunk: str) -> str:
-        """Añade contexto técnico cuando es necesario"""
-        if "shellcode" in chunk and "platform" not in chunk:
-            return f"[Shellcode Technique]\n{chunk}"
-        if "ROP" in chunk and not chunk.startswith("ROP Chain"):
-            return f"ROP Technique: {chunk}"
-        return chunk
+                spans.append((s, e))
+        return spans
+
+    def _expand_leading_decorators(self, text: str, start: int) -> int:
+        i = start
+        while True:
+            prev_line_start = text.rfind("\n", 0, i - 1) + 1 if i > 0 else 0
+            if text[prev_line_start:i].strip().startswith("@"):
+                i = prev_line_start
+                continue
+            break
+        return i
+
+    def _expand_leading_comments(self, text: str, start: int) -> int:
+        i = start
+        while True:
+            prev_line_start = text.rfind("\n", 0, i - 1) + 1 if i > 0 else 0
+            strip = text[prev_line_start:i].strip()
+            if strip.startswith("#") or strip.startswith("//") or strip.startswith("/*"):
+                i = prev_line_start
+                continue
+            break
+        return i
+
+    def _assemble_chunks_from_spans(self, spans: List[Tuple[int, int]], text: str) -> List[str]:
+        chunks: List[str] = []
+        if not spans:
+            return chunks
+
+        current_start, current_end = spans[0]
+        for s, e in spans[1:]:
+            candidate_len = (e - current_start)
+            if candidate_len <= self.max_size and s <= current_end + 2048:
+                current_end = e
+            else:
+                chunks.append(text[current_start:current_end])
+                current_start, current_end = s, e
+
+        chunks.append(text[current_start:current_end])
+
+        header_imports = self._leading_import_block(text)
+        if header_imports and chunks:
+            chunks[0] = header_imports + "\n" + chunks[0]
+
+        cleaned: List[str] = []
+        buf = ""
+        for ch in chunks:
+            if len(ch) < self.min_size:
+                buf = (buf + "\n" + ch) if buf else ch
+            else:
+                if buf:
+                    merged = buf + "\n" + ch
+                    if len(merged) <= self.max_size:
+                        cleaned.append(merged)
+                    else:
+                        cleaned.append(buf)
+                        cleaned.append(ch)
+                    buf = ""
+                else:
+                    cleaned.append(ch)
+        if buf:
+            cleaned.append(buf)
+
+        return cleaned
+
+    def _leading_import_block(self, text: str) -> str:
+        lines = text.splitlines()
+        acc = []
+        for line in lines[:200]:
+            if re.match(r"^\s*(import |from |#include|using\s+namespace)", line):
+                acc.append(line)
+            elif line.strip() == "" and acc:
+                acc.append(line)
+            elif acc:
+                break
+        return "\n".join(acc).strip()
