@@ -1,4 +1,3 @@
-#File: app/utils/pdf_utils.py
 from __future__ import annotations
 
 import hashlib
@@ -16,6 +15,8 @@ from app.config import settings
 from app.utils.chunk_strategies import ChunkStrategy
 
 logger = setup_logger(__name__, level=settings.LOG_LEVEL)
+
+# -------------------------- helpers de normalización --------------------------
 
 _FENCE_RE = re.compile(r"(^```[a-zA-Z0-9_+\-]*\s*$)(.*?)(^```$)", re.MULTILINE | re.DOTALL)
 _HARD_HYPHEN_RE = re.compile(r"(\w)-\n(\w)")
@@ -36,12 +37,14 @@ def _normalize_text_light(text: str) -> str:
 def _tail_carry(text: str, base_chars: int = 400) -> str:
     if not text:
         return ""
+
     t_eval = text[-max(base_chars * 3, 1000):]
     fence_count = t_eval.count("```")
     braces_open = t_eval.count("{") - t_eval.count("}")
     paren_open = t_eval.count("(") - t_eval.count(")")
     indent_lines = [ln for ln in t_eval.splitlines()[-8:] if ln.strip()]
     indent_ratio = sum(1 for ln in indent_lines if re.match(r"^\s{2,}|\t", ln)) / max(len(indent_lines), 1)
+
     carry = text[-base_chars:]
     if fence_count % 2 == 1 or braces_open > 0 or paren_open > 0 or indent_ratio > 0.35:
         carry = text[-min(len(text), base_chars * 2):]
@@ -52,7 +55,12 @@ def _dedupe_key(s: str) -> str:
     return hashlib.md5(s.strip().encode("utf-8", errors="ignore")).hexdigest()
 
 
+# --------------------------- extracción por PyMuPDF ---------------------------
+
 def _extract_text_fitz(page: fitz.Page, mode: str = "blocks", sort: bool = True) -> str:
+    """
+    Extrae texto en modos livianos. Evitamos 'xhtml' (muy costoso).
+    """
     try:
         if mode == "blocks":
             blocks = page.get_text("blocks", sort=sort)
@@ -60,13 +68,14 @@ def _extract_text_fitz(page: fitz.Page, mode: str = "blocks", sort: bool = True)
                 blocks = sorted(blocks, key=lambda b: (round(b[1], 2), round(b[0], 2)))
             except Exception:
                 pass
-            text = "\n".join(b[4] for b in blocks if isinstance(b, (list, tuple)) and len(b) >= 5 and b[4])
+            text = "\n".join(
+                b[4] for b in blocks
+                if isinstance(b, (list, tuple)) and len(b) >= 5 and b[4]
+            )
             if text and text.strip():
                 return text
+        # Fallback rápido a "text"
         t = page.get_text("text", sort=sort)
-        if not t:
-            # Fallback extra (algunos PDFs devuelven mejor con xhtml)
-            t = page.get_text("xhtml")
         return t or ""
     except Exception as e:
         logger.debug(f"fitz.get_text fallback due to: {e}")
@@ -76,6 +85,8 @@ def _extract_text_fitz(page: fitz.Page, mode: str = "blocks", sort: bool = True)
             return ""
 
 
+# --------------------------- tablas via pdfplumber ----------------------------
+
 def _maybe_extract_tables(
     page_plumb: pdfplumber.page.Page,
     enable: bool,
@@ -84,6 +95,7 @@ def _maybe_extract_tables(
     if not enable:
         return []
     try:
+        # Heurística barata: si no hay líneas/rectángulos, probablemente no hay tabla “line-based”
         lines = len(page_plumb.lines or [])
         rects = len(page_plumb.rects or [])
         if (lines + rects) < 6:
@@ -105,6 +117,8 @@ def _maybe_extract_tables(
         return []
 
 
+# -------------------------- iterador de páginas dual --------------------------
+
 def _iter_pages_dual(
     pdf_path: str,
     enable_tables: bool = True,
@@ -118,6 +132,7 @@ def _iter_pages_dual(
                 text = _extract_text_fitz(page, mode=fitz_mode, sort=fitz_sort)
                 yield i, text, []
         else:
+            # pdfplumber se abre una sola vez para todo el documento (lazy pages)
             with pdfplumber.open(pdf_path) as pdoc:
                 total = len(fdoc)
                 for i in range(total):
@@ -128,16 +143,25 @@ def _iter_pages_dual(
                     yield i + 1, text, tables
 
 
+# ------------------------------ API principal --------------------------------
+
 async def extract_chunks_from_pdf(
     pdf_path: str,
     strategy: ChunkStrategy,
     carry_chars: int = settings.PDF_CARRY_CHARS,
     trim_carry_on_first_chunk: bool = True,
     progress: Optional[Progress] = None,
-    prefer_tables: bool = True,
+    prefer_tables: bool = True,                # default TRUE
     table_settings: Optional[dict] = None,
     dedupe: bool = True,
 ) -> List[Dict]:
+    """
+    Extrae y chunkea el PDF página a página usando:
+      • PyMuPDF (texto principal en *reading order*),
+      • pdfplumber (opcional) solo para *tablas*.
+
+    Retorna: [{'id': '0001-0001', 'text': '...', 'meta': {source,page,chunk,content_type}}]
+    """
     process = psutil.Process()
     tracemalloc.start()
     initial_rss = process.memory_info().rss / 1e6
@@ -176,10 +200,10 @@ async def extract_chunks_from_pdf(
             working_text = (prev_tail + "\n" + page_text) if prev_tail else page_text
             base_carry_len = len(prev_tail)
 
-            # --- Guard: no intentar chunking si no hay texto útil ---
+            # Guard: si la página no tiene texto útil, avanzamos progreso y seguimos.
             if not working_text or not working_text.strip():
                 logger.debug(f"⚠️  Page {page_no}: empty working_text (len={len(working_text) if working_text else 0})")
-                prev_tail = ""  # nada que arrastrar
+                prev_tail = ""
                 if progress and p_task is not None:
                     progress.advance(p_task)
                 continue

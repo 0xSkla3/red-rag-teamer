@@ -45,8 +45,7 @@ tree-sitter==0.25.1
 # Grammars oficiales (agregá/quitá según lo que realmente uses)
 tree-sitter-python==0.23.6
 tree-sitter-javascript==0.23.1
-tree-sitter-typescript==0.23.2   # provee TypeScript; para TSX ver línea siguiente
-tree-sitter-tsx==0.23.0          # TSX como paquete separado
+tree-sitter-typescript==0.23.2   # contiene TypeScript y TSX
 tree-sitter-c==0.24.1
 tree-sitter-cpp==0.23.4
 tree-sitter-java==0.23.5
@@ -55,5 +54,5 @@ tree-sitter-rust==0.24.0
 tree-sitter-bash==0.25.0
 tree-sitter-php==0.23.11
 tree-sitter-ruby==0.23.1
-tree-sitter-c-sharp==0.1.33      # paquete oficial para C# (nomenclatura con guion)
+tree-sitter-c-sharp==0.23.1
 tree-sitter-json==0.24.8
